@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	expro "github.com/expr-lang/expr"
 	"github.com/xuri/excelize/v2"
@@ -88,12 +89,23 @@ type Template struct {
 
 // rowTpl описывает свойства шаблонной строки (стили, исходные значения, горизонтальные слияния)
 type rowTpl struct {
-	styles  map[int]int
-	rawVals map[int]string
-	merges  []struct {
+	styles      map[int]int    // 样式ID映射
+	styleProps  map[int]*Style // 样式属性缓存
+	rawVals     map[int]string // 原始值
+	cellFormats map[int]string // 单元格格式
+	merges      []struct {
 		startCol int
 		endCol   int
 	}
+}
+
+// Style 存储单元格样式的关键属性
+type Style struct {
+	Font      *excelize.Font
+	Fill      excelize.Fill
+	Border    []excelize.Border
+	Alignment *excelize.Alignment
+	NumFmt    int
 }
 
 // -----------------------------
@@ -278,15 +290,38 @@ func parseSheet(f *excelize.File, sheet string) (*sheetTemplate, error) {
 
 	const maxCols = 100
 	for tplRow := range tplRowsSet {
-		rt := rowTpl{styles: make(map[int]int), rawVals: make(map[int]string)}
+		rt := rowTpl{
+			styles:      make(map[int]int),
+			styleProps:  make(map[int]*Style),
+			rawVals:     make(map[int]string),
+			cellFormats: make(map[int]string),
+		}
 		for col := 1; col <= maxCols; col++ {
 			addr, _ := excelize.CoordinatesToCellName(col, tplRow)
 			v, _ := f.GetCellValue(sheet, addr)
 			if v != "" {
 				rt.rawVals[col] = v
 			}
+
+			// 获取单元格样式ID
 			if sid, err := f.GetCellStyle(sheet, addr); err == nil && sid != 0 {
 				rt.styles[col] = sid
+
+				// 获取并存储完整样式属性
+				if styleProps, err := f.GetStyle(sid); err == nil {
+					rt.styleProps[col] = &Style{
+						Font:      styleProps.Font,
+						Fill:      styleProps.Fill,
+						Border:    styleProps.Border,
+						Alignment: styleProps.Alignment,
+						NumFmt:    styleProps.NumFmt,
+					}
+
+					// 存储数字格式信息
+					if styleProps.NumFmt > 0 {
+						rt.cellFormats[col] = fmt.Sprintf("%d", styleProps.NumFmt)
+					}
+				}
 			}
 		}
 		merges, _ := f.GetMergeCells(sheet)
@@ -1137,8 +1172,37 @@ func (t *Template) applyRendered(st *sheetTemplate, rows []renderRow) error {
 		// Стили из образца
 		for col, sid := range rt.styles {
 			addr, _ := excelize.CoordinatesToCellName(col, dstRow)
+
+			// 首先尝试直接应用样式ID
 			if err := t.f.SetCellStyle(sheet, addr, addr, sid); err != nil {
-				return err
+				// 如果直接应用样式ID失败，尝试使用缓存的样式属性重新创建样式
+				if styleProps, ok := rt.styleProps[col]; ok {
+					// 创建新的样式
+					newStyle, err := t.f.NewStyle(&excelize.Style{
+						Font:      styleProps.Font,
+						Fill:      styleProps.Fill,
+						Border:    styleProps.Border,
+						Alignment: styleProps.Alignment,
+						NumFmt:    styleProps.NumFmt,
+					})
+					if err == nil {
+						_ = t.f.SetCellStyle(sheet, addr, addr, newStyle)
+					}
+				}
+			}
+
+			// 应用数字格式（如果有）
+			if format, ok := rt.cellFormats[col]; ok && format != "" {
+				numFmt, err := strconv.Atoi(format)
+				if err == nil && numFmt > 0 {
+					// 创建仅包含数字格式的样式
+					numFmtStyle, err := t.f.NewStyle(&excelize.Style{
+						NumFmt: numFmt,
+					})
+					if err == nil {
+						_ = t.f.SetCellStyle(sheet, addr, addr, numFmtStyle)
+					}
+				}
 			}
 		}
 		// Статические значения (без выражений) из образца
@@ -1157,6 +1221,41 @@ func (t *Template) applyRendered(st *sheetTemplate, rows []renderRow) error {
 		// Рендеренные значения поверх
 		for col, val := range rr.values {
 			addr, _ := excelize.CoordinatesToCellName(col, dstRow)
+
+			// 检查是否有数字格式
+			hasNumFmt := false
+			var numFmt int
+			if format, ok := rt.cellFormats[col]; ok && format != "" {
+				if nf, err := strconv.Atoi(format); err == nil && nf > 0 {
+					hasNumFmt = true
+					numFmt = nf
+				}
+			}
+
+			// 根据数字格式和值类型决定如何设置单元格值
+			if hasNumFmt {
+				// 对于日期格式(如14, 15, 16, 17等)，尝试解析日期
+				if numFmt >= 14 && numFmt <= 22 {
+					// 尝试解析日期字符串
+					if date, err := time.Parse("2006-01-02", val); err == nil {
+						_ = t.f.SetCellValue(sheet, addr, date)
+						continue
+					} else if date, err := time.Parse("2006-01-02 15:04:05", val); err == nil {
+						_ = t.f.SetCellValue(sheet, addr, date)
+						continue
+					}
+				}
+
+				// 对于数字格式，尝试解析为数字
+				if numFmt > 0 && numFmt != 49 { // 49是文本格式
+					if num, err := strconv.ParseFloat(val, 64); err == nil {
+						_ = t.f.SetCellValue(sheet, addr, num)
+						continue
+					}
+				}
+			}
+
+			// 默认情况下，直接设置字符串值
 			if err := t.f.SetCellValue(sheet, addr, val); err != nil {
 				return err
 			}

@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"path/filepath"
+	"testing"
 
 	"github.com/xuri/excelize/v2"
 
@@ -10,7 +11,7 @@ import (
 )
 
 // Example: simple array with {{#each}}
-func main() {
+func TestArray(t *testing.T) {
 	tmpDir := "."
 	templatePath := filepath.Join(tmpDir, "simple_array_template.xlsx")
 	outputPath := filepath.Join(tmpDir, "simple_array_output.xlsx")
